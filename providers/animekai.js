@@ -511,6 +511,15 @@ function getStreams(tmdbId, mediaType, season, episode) {
     return getTMDBDetails(tmdbId, 'tv')
         .then(function(info) {
             mediaInfo = info || { title: null, year: null };
+
+            var isAnime =
+            (mediaInfo.origin_country && mediaInfo.origin_country.includes("JP")) ||
+            (Array.isArray(mediaInfo.genres) && mediaInfo.genres.some(g => g.name === "Animation"));
+
+            if (!isAnime) {
+            // Not anime → return empty result
+                return Promise.reject(new Error("Not anime"));
+            }
             var titleToSearch = mediaInfo.title || '';
 
             // For series with multiple seasons/arcs, search with season info to get better results
