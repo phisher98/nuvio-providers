@@ -511,13 +511,17 @@ function getStreams(tmdbId, mediaType, season, episode) {
     return getTMDBDetails(tmdbId, 'tv')
         .then(function(info) {
             mediaInfo = info || { title: null, year: null };
+logRid(rid, "TMDB info", {
+    title: mediaInfo.title,
+    genres: mediaInfo.genres,
+    origin_country: mediaInfo.origin_country
+});
 
             var isAnime =
             (mediaInfo.origin_country && mediaInfo.origin_country.includes("JP")) ||
             (Array.isArray(mediaInfo.genres) && mediaInfo.genres.some(g => g.name === "Animation"));
 
             if (!isAnime) {
-            // Not anime → return empty result
                 return Promise.reject(new Error("Not anime"));
             }
             var titleToSearch = mediaInfo.title || '';
