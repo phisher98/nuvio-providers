@@ -511,11 +511,7 @@ function getStreams(tmdbId, mediaType, season, episode) {
     return getTMDBDetails(tmdbId, 'tv')
         .then(function(info) {
             mediaInfo = info || { title: null, year: null };
-logRid(rid, "TMDB info", {
-    title: mediaInfo.title,
-    genres: mediaInfo.genres,
-    origin_country: mediaInfo.origin_country
-});
+            console.log("TMDB info:", mediaInfo);
 
             var isAnime =
             (mediaInfo.origin_country && mediaInfo.origin_country.includes("JP")) ||
