@@ -1,7 +1,7 @@
 // Moviesdrive Scraper for Nuvio Local Scrapers
 // React Native compatible version with full original functionality
 
-const cheerio = require('cheerio-without-node-native');
+const cheerio = require('cheerio');
 
 
 // TMDB API Configuration
@@ -41,6 +41,7 @@ function extractServerName(source) {
     // HubCloud servers (match Kotlin behavior)
     if (/HubCloud/i.test(src)) {
         if (/FSL/i.test(src)) return 'HubCloud FSL Server';
+        if (/FSL V2/i.test(src)) return 'HubCloud FSL V2 Server';
         if (/S3/i.test(src)) return 'HubCloud S3 Server';
         if (/Buzz/i.test(src)) return 'HubCloud BuzzServer';
         if (/10\s*Gbps/i.test(src)) return 'HubCloud 10Gbps';
@@ -511,6 +512,9 @@ function hubCloudExtractor(url, referer) {
                 if (text.includes("Download File")) {
                     links.push({ source: `HubCloud ${labelExtras}`, quality, url: link, size: sizeInBytes, fileName });
                     return Promise.resolve();
+                } else if (text.includes("FSL V2")) {
+                    links.push({ source: `HubCloud - FSL V2 Server ${labelExtras}`, quality, url: link, size: sizeInBytes, fileName });
+                    return Promise.resolve();
                 } else if (text.includes("FSL")) {
                     links.push({ source: `HubCloud - FSL Server ${labelExtras}`, quality, url: link, size: sizeInBytes, fileName });
                     return Promise.resolve();
@@ -540,8 +544,16 @@ function hubCloudExtractor(url, referer) {
                             console.error("[HubCloud] BuzzServer redirect failed for", link, e.message);
                         });
                 } else if (link.includes("pixeldra")) {
-                    links.push({ source: `Pixeldrain ${labelExtras}`, quality, url: link, size: sizeInBytes, fileName });
-                    return Promise.resolve();
+                    return pixelDrainExtractor(link)
+                        .then(extracted => {
+                            links.push(...extracted.map(l => ({
+                                ...l,
+                                quality: typeof l.quality === 'number' ? l.quality : quality,
+                                size: l.size || sizeInBytes,
+                                fileName
+                            })));
+                        })
+                        .catch(() => { });
                 } else if (text.includes("10Gbps")) {
                     let currentRedirectUrl = link;
                     let finalLink = null;
@@ -591,6 +603,208 @@ function hubCloudExtractor(url, referer) {
         .catch(() => []);
 }
 
+
+async function gdFlixExtractor(url, referer = null) {
+    const links = [];
+
+    const getIndexQuality = (name) => {
+        const m = (name || '').match(/(\d{3,4})[pP]/);
+        return m ? parseInt(m[1]) : 2160;
+    };
+
+    const toBytes = (size) => {
+        if (!size) return 0;
+        const m = size.match(/([\d.]+)\s*(GB|MB|KB)/i);
+        if (!m) return 0;
+        const v = parseFloat(m[1]);
+        return m[2].toUpperCase() === 'GB' ? v * 1024 ** 3 :
+            m[2].toUpperCase() === 'MB' ? v * 1024 ** 2 :
+                v * 1024;
+    };
+
+    try {
+        /* meta refresh redirect */
+        let res = await fetch(url, { headers: HEADERS });
+        let html = await res.text();
+        let refresh = html.match(/url=([^"]+)/i);
+        let finalUrl = refresh ? refresh[1] : url;
+
+        const page = await fetch(finalUrl, { headers: HEADERS }).then(r => r.text());
+        const $ = cheerio.load(page);
+
+        const fileName = $('li:contains("Name")').text().replace('Name :', '').trim();
+        const fileSizeText = $('li:contains("Size")').text().replace('Size :', '').trim();
+        const quality = getIndexQuality(fileName);
+        const sizeBytes = toBytes(fileSizeText);
+
+        const anchors = $('div.text-center a[href]').get();
+
+        for (const a of anchors) {
+            const el = $(a);
+            const text = el.text().toLowerCase();
+            const href = el.attr('href');
+
+            /* DIRECT */
+            if (text.includes('direct')) {
+                links.push({
+                    source: 'GDFlix [Direct]',
+                    quality,
+                    url: href,
+                    size: sizeBytes,
+                    fileName
+                });
+            }
+
+            /* INDEX LINKS */
+            else if (text.includes('index')) {
+                const indexPage = await fetch(`https://new6.gdflix.dad${href}`).then(r => r.text());
+                const $$ = cheerio.load(indexPage);
+
+                const btns = $$('a.btn-outline-info').get();
+                for (const b of btns) {
+                    const serverUrl = 'https://new6.gdflix.dad' + $$(b).attr('href');
+                    const serverPage = await fetch(serverUrl).then(r => r.text());
+                    const $$$ = cheerio.load(serverPage);
+
+                    $$$('div.mb-4 > a[href]').each((_, x) => {
+                        links.push({
+                            source: 'GDFlix [Index]',
+                            quality,
+                            url: $$(x).attr('href'),
+                            size: sizeBytes,
+                            fileName
+                        });
+                    });
+                }
+            }
+
+            /* DRIVEBOT */
+            else if (text.includes('drivebot')) {
+                const id = href.match(/id=([^&]+)/)?.[1];
+                const doId = href.match(/do=([^=]+)/)?.[1];
+                if (!id || !doId) continue;
+
+                const bases = ['https://drivebot.sbs', 'https://drivebot.cfd'];
+
+                for (const base of bases) {
+                    try {
+                        const bot = await fetch(`${base}/download?id=${id}&do=${doId}`);
+                        const cookie = bot.headers.get('set-cookie') || '';
+                        const html = await bot.text();
+
+                        const token = html.match(/token', '([a-f0-9]+)/)?.[1];
+                        const postId = html.match(/download\?id=([^']+)/)?.[1];
+                        if (!token || !postId) continue;
+
+                        const dl = await fetch(`${base}/download?id=${postId}`, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/x-www-form-urlencoded',
+                                'Referer': `${base}/download?id=${id}&do=${doId}`,
+                                'Cookie': cookie
+                            },
+                            body: `token=${token}`
+                        }).then(r => r.text());
+
+                        const final = dl.match(/url":"(.*?)"/)?.[1]?.replace(/\\/g, '');
+                        if (final) {
+                            links.push({
+                                source: 'GDFlix [DriveBot]',
+                                quality,
+                                url: final,
+                                size: sizeBytes,
+                                fileName
+                            });
+                        }
+                    } catch { }
+                }
+            }
+
+            /* INSTANT DL */
+            else if (text.includes('instant')) {
+                const r = await fetch(href, { redirect: 'manual' });
+                const loc = r.headers.get('location');
+                if (loc) {
+                    links.push({
+                        source: 'GDFlix [Instant]',
+                        quality,
+                        url: loc.replace('url=', ''),
+                        size: sizeBytes,
+                        fileName
+                    });
+                }
+            }
+
+            /* GOFILE */
+            else if (text.includes('gofile')) {
+                const extracted = await goFileExtractor(href);
+                extracted.forEach(l => links.push({
+                    ...l,
+                    quality,
+                    size: l.size || sizeBytes,
+                    fileName
+                }));
+            }
+
+            /* PIXELDRAIN */
+            else if (text.includes('pixel')) {
+                links.push({
+                    source: 'GDFlix [PixelDrain]',
+                    quality,
+                    url: href,
+                    size: sizeBytes,
+                    fileName
+                });
+            }
+        }
+    } catch { }
+
+    return links;
+}
+
+async function goFileExtractor(url) {
+    const links = [];
+    try {
+        const id = url.match(/(?:\?c=|\/d\/)([a-zA-Z0-9-]+)/)?.[1];
+        if (!id) return [];
+
+        const acc = await fetch('https://api.gofile.io/accounts', { method: 'POST' }).then(r => r.json());
+        const token = acc?.data?.token;
+        if (!token) return [];
+
+        const js = await fetch('https://gofile.io/dist/js/global.js').then(r => r.text());
+        const wt = js.match(/appdata\.wt\s*=\s*["']([^"']+)/)?.[1];
+        if (!wt) return [];
+
+        const data = await fetch(`https://api.gofile.io/contents/${id}?wt=${wt}`, {
+            headers: { Authorization: `Bearer ${token}` }
+        }).then(r => r.json());
+
+        const files = Object.values(data.data.children);
+        const file = files[0];
+        if (!file) return [];
+
+        const size = file.size;
+        const sizeFormatted =
+            size < 1024 ** 3
+                ? `${(size / 1024 ** 2).toFixed(2)} MB`
+                : `${(size / 1024 ** 3).toFixed(2)} GB`;
+
+        links.push({
+            source: 'GoFile',
+            quality: getIndexQuality(file.name),
+            url: file.link,
+            size,
+            fileName: file.name,
+            headers: { Cookie: `accountToken=${token}` },
+            label: `GoFile [${sizeFormatted}]`
+        });
+    } catch { }
+
+    return links;
+}
+
+
 /**
  * Main extractor dispatcher. Determines which specific extractor to use based on the URL.
  * Replicates the `loadExtractor` logic flow.
@@ -611,6 +825,14 @@ function loadExtractor(url, referer = MAIN_URL) {
                 // Recursively call loadExtractor with the new link
                 return loadExtractor(finalLink, url);
             });
+    }
+
+    if (hostname.includes('gdflix')) {
+        return gdFlixExtractor(url, referer);
+    }
+
+    if (hostname.includes('gofile')) {
+        return goFileExtractor(url);
     }
 
     if (hostname.includes('hubcloud')) {
@@ -707,7 +929,7 @@ function getCinemetaData(imdbId, tvType) {
  * @param {string} mediaUrl The URL of the movie or TV show page.
  * @returns {Promise<Array<any>>} A list of all final, extracted download links.
  */
-function getDownloadLinks(mediaUrl) {
+function getDownloadLinks(mediaUrl, season, episode) {
     return getCurrentDomain()
         .then(currentDomain => {
             HEADERS.Referer = `${currentDomain}/`;
@@ -738,52 +960,52 @@ function getDownloadLinks(mediaUrl) {
                 const hosterRegex = /hubcloud|gdflix|gdlink/i;
 
                 const extractMdrive = (url) => {
-    return fetch(url, {
-        headers: {
-            'User-Agent': 'Mozilla/5.0'
-        }
-    })
-    .then(res => res.text())
-    .then(html => {
-        const $$ = cheerio.load(html);
+                    return fetch(url, {
+                        headers: {
+                            'User-Agent': 'Mozilla/5.0'
+                        }
+                    })
+                        .then(res => res.text())
+                        .then(html => {
+                            const $$ = cheerio.load(html);
 
-        return $$('a[href]')
-            .map((_, el) => {
-                const href = $$(el).attr('href');
-                return hosterRegex.test(href) ? href : null;
-            })
-            .get()
-            .filter(Boolean);
-    })
-    .catch(e => {
-        console.error('[Moviesdrive] Error extracting links:', e.message);
-        return [];
-    });
-};
+                            return $$('a[href]')
+                                .map((_, el) => {
+                                    const href = $$(el).attr('href');
+                                    return hosterRegex.test(href) ? href : null;
+                                })
+                                .get()
+                                .filter(Boolean);
+                        })
+                        .catch(e => {
+                            console.error('[Moviesdrive] Error extracting links:', e.message);
+                            return [];
+                        });
+                };
 
 
                 const promises = links.map(url => {
-    return extractMdrive(url).then(extractedUrls => {
-        return Promise.all(
-            extractedUrls.map(serverUrl =>
-                loadExtractor(serverUrl, mediaUrl)
-                    .catch(err => {
-                        console.error(
-                            `[Moviesdrive] Failed extractor ${serverUrl}:`,
-                            err.message
+                    return extractMdrive(url).then(extractedUrls => {
+                        return Promise.all(
+                            extractedUrls.map(serverUrl =>
+                                loadExtractor(serverUrl, mediaUrl)
+                                    .catch(err => {
+                                        console.error(
+                                            `[Moviesdrive] Failed extractor ${serverUrl}:`,
+                                            err.message
+                                        );
+                                        return [];
+                                    })
+                            )
                         );
+                    }).catch(err => {
+                        console.error('[Moviesdrive] Failed extractMdrive:', err.message);
                         return [];
-                    })
-            )
-        );
-    }).catch(err => {
-        console.error('[Moviesdrive] Failed extractMdrive:', err.message);
-        return [];
-    });
-});
+                    });
+                });
 
 
-                return Promise.all(promises).then(results => {
+                return Promise.all(extractorPromises).then(results => {
                     const flat = results.flat(2);
 
                     const seen = new Set();
@@ -793,91 +1015,121 @@ function getDownloadLinks(mediaUrl) {
                         return true;
                     });
 
-                    console.error(`[Moviesdrive] Final extracted links: ${finalLinks.length}`);
-                    return { finalLinks, isMovie };
+                    console.error(
+                        `[Moviesdrive] Final extracted episode streams: ${finalLinks.length}`
+                    );
+
+                    return {
+                        finalLinks,
+                        isMovie: false
+                    };
                 });
-            }
-            else {
-                // TV Series
-                const seasonPattern = new RegExp(`Season\\s*0?${season}\\b|S0?${season}\\b`, 'i');
-                const episodePattern = new RegExp(
-                    `Ep\\s?0?${episode}\\b|Episode\\s+0?${episode}\\b|V-Cloud|G-Direct|OXXFile`,
-                    'i'
-                );
 
-                const seasonElements = $('h5').filter((_, el) =>
-                    seasonPattern.test($(el).text())
-                );
+            } else {
+                // =========================
+                // TV SERIES FLOW
+                // =========================
 
-                let allLinks = [];
-                let seasonPromises = [];
+                const seasonPattern = new RegExp(`Season\\s*0?${season}\\b`, 'i');
+                const episodePattern = new RegExp(`Ep\\s*0?${episode}\\b`, 'i');
 
-                seasonElements.each((_, el) => {
-                    const seasonHref = $(el).next()?.find('a')?.attr('href');
-                    if (!seasonHref) return;
+                const seasonPageUrls = [];
 
-                    const p = fetch(seasonHref, { headers: HEADERS })
+                $('h5').each((_, el) => {
+                    const text = $(el).text();
+
+                    if (seasonPattern.test(text)) {
+                        $(el).nextAll('h5').each((_, h5) => {
+                            const a = $(h5).find('a[href]');
+                            if (a.length && /single\s*episode/i.test(a.text())) {
+                                const href = a.attr('href');
+                                if (href && !seasonPageUrls.includes(href)) {
+                                    seasonPageUrls.push(href);
+                                }
+                            }
+                        });
+                    }
+                });
+
+                if (seasonPageUrls.length === 0) {
+                    console.error('[Moviesdrive] No single-episode pages found for season', season);
+                    return Promise.resolve({ finalLinks: [], isMovie: false });
+                }
+
+                const mdrivePromises = seasonPageUrls.map(seasonPageUrl =>
+                    fetch(seasonPageUrl, { headers: HEADERS })
                         .then(r => r.text())
                         .then(html => {
                             const $$ = cheerio.load(html);
-                            const episodeHeaders = $$('h5').filter((_, h) =>
-                                episodePattern.test($$(h).text())
-                            );
+                            const episodeLinks = [];
 
-                            episodeHeaders.each((_, header) => {
-                                let next = $$(header).next();
+                            $$('h5').each((_, h) => {
+                                if (episodePattern.test($$(h).text())) {
+                                    let next = $$(h).next();
 
-                                while (next.length && next.prop('tagName') !== 'HR') {
-                                    if (next.prop('tagName') === 'H5') {
-                                        const a = next.find('a').first();
-                                        const href = a.attr('href');
-                                        const text = a.text();
-
-                                        if (href && !/zip/i.test(text)) {
-                                            allLinks.push(href);
+                                    while (next.length && next.prop('tagName') !== 'HR') {
+                                        const a = next.find('a[href]').addBack('a[href]');
+                                        if (a.length) {
+                                            const href = a.attr('href');
+                                            if (/hubcloud|gdflix/i.test(href)) {
+                                                episodeLinks.push(href);
+                                            }
                                         }
+                                        next = next.next();
                                     }
-                                    next = next.next();
                                 }
                             });
+
+                            //console.log(`[DEBUG] Episode links from ${seasonPageUrl}:`,episodeLinks);
+
+                            return episodeLinks;
                         })
-                        .catch(() => { });
+                        .catch(() => [])
+                );
 
-                    seasonPromises.push(p);
-                });
+                return Promise.all(mdrivePromises).then(allEpisodeLinks => {
+                    const flatLinks = allEpisodeLinks.flat();
 
-                return Promise.all(seasonPromises).then(() => {
-                    if (allLinks.length > 0) {
-                        const extractorPromises = allLinks.map(serverUrl =>
-                            loadExtractor(serverUrl, mediaUrl)
-                                .catch(e => {
-                                    console.error(`Failed to extract from ${serverUrl}:`, e.message);
-                                    return [];
-                                })
-                        );
-
-                        return Promise.all(extractorPromises);
-                    } else {
-                        const fallbackLinks = $('h5 a')
-                            .filter((_, el) =>
-                                /HubCloud/i.test($(el).text()) && $(el).attr('href')
-                            )
-                            .map((_, el) => $(el).attr('href'))
-                            .get();
-
-                        const fallbackPromises = fallbackLinks.map(url =>
-                            loadExtractor(url, mediaUrl)
-                                .catch(e => {
-                                    console.error(`Failed to extract fallback ${url}:`, e.message);
-                                    return [];
-                                })
-                        );
-
-                        return Promise.all(fallbackPromises);
+                    if (flatLinks.length === 0) {
+                        console.error('[Moviesdrive] No episode links found for episode', episode);
+                        return { finalLinks: [], isMovie: false };
                     }
-                });
-            }
 
+                    const extractorPromises = flatLinks.map(serverUrl =>
+                        console.log('[DEBUG] Loading extractor for', serverUrl) ||
+                        loadExtractor(serverUrl, seasonPageUrls[0])
+                            .catch(e => {
+                                console.error(
+                                    `[Moviesdrive] Failed extractor ${serverUrl}:`,
+                                    e.message
+                                );
+                                return [];
+                            })
+                    );
+
+                    return Promise.all(extractorPromises).then(results => {
+                        const flat = results.flat();
+
+                        // Deduplicate by URL (same as movies)
+                        const seen = new Set();
+                        const finalLinks = flat.filter(link => {
+                            if (!link?.url || seen.has(link.url)) return false;
+                            seen.add(link.url);
+                            return true;
+                        });
+
+                        console.log(
+                            `[Moviesdrive] Final extracted episode streams: ${finalLinks.length}`
+                        );
+
+                        return {
+                            finalLinks,
+                            isMovie: false
+                        };
+                    });
+                });
+
+            }
 
         });
 }
@@ -1068,53 +1320,43 @@ function getStreams(tmdbId, mediaType = 'movie', season = null, episode = null) 
             console.log(`[Moviesdrive] Selected: "${selectedMedia.title}" (${selectedMedia.url})`);
 
             // Get download links
-            return getDownloadLinks(selectedMedia.url).then(function (result) {
+            return getDownloadLinks(selectedMedia.url, season, episode).then(function (result) {
                 const { finalLinks, isMovie } = result;
 
-                // Filter by episode if specified for TV shows
                 let filteredLinks = finalLinks;
-                if (mediaType === 'tv' && episode !== null) {
-                    filteredLinks = finalLinks.filter(function (link) {
-                        return link.episode === episode;
-                    });
-                    console.log(`[Moviesdrive] Filtered to ${filteredLinks.length} links for episode ${episode}`);
-                }
 
-                // Convert to Nuvio format, filtering out unknown quality links
                 const streams = filteredLinks
                     .filter(function (link) {
-                        // Skip links with unknown quality - these are usually just redirects
-                        if (typeof link.quality !== 'number' || link.quality === 0) {
-                            return false;
-                        }
-                        return true;
+                        return typeof link.quality === 'number' && link.quality > 0;
                     })
                     .map(function (link) {
-                        // Use the actual file name from HubCloud page if available, otherwise fallback to TMDB title
-                        let mediaTitle = link.fileName && link.fileName !== 'Unknown' ? link.fileName : mediaInfo.title;
-                        if (mediaType === 'tv' && season && episode && link.episode && !link.fileName) {
-                            mediaTitle = `${mediaInfo.title} S${String(season).padStart(2, '0')}E${String(link.episode).padStart(2, '0')}`;
-                        } else if (mediaType === 'tv' && season && episode && !link.fileName) {
-                            mediaTitle = `${mediaInfo.title} S${String(season).padStart(2, '0')}E${String(episode).padStart(2, '0')}`;
-                        } else if (mediaInfo.year && !link.fileName) {
+                        let mediaTitle;
+                        if (link.fileName && link.fileName !== 'Unknown') {
+                            mediaTitle = link.fileName;
+                        } else if (mediaType === 'tv' && season && episode) {
+                            mediaTitle =
+                                `${mediaInfo.title} ` +
+                                `S${String(season).padStart(2, '0')}` +
+                                `E${String(episode).padStart(2, '0')}`;
+                        } else if (mediaInfo.year) {
                             mediaTitle = `${mediaInfo.title} (${mediaInfo.year})`;
+                        } else {
+                            mediaTitle = mediaInfo.title;
                         }
 
-                        // Format size and extract server name
+                        // Size & server
                         const formattedSize = formatBytes(link.size);
                         const serverName = extractServerName(link.source);
 
-                        // Create quality string
+                        // Quality normalization (APP-SAFE)
                         let qualityStr = 'Unknown';
-                        if (typeof link.quality === 'number') {
-                            if (link.quality >= 2160) qualityStr = '4K';
-                            else if (link.quality >= 1440) qualityStr = '1440p';
-                            else if (link.quality >= 1080) qualityStr = '1080p';
-                            else if (link.quality >= 720) qualityStr = '720p';
-                            else if (link.quality >= 480) qualityStr = '480p';
-                            else if (link.quality >= 360) qualityStr = '360p';
-                            else qualityStr = '240p';
-                        }
+                        if (link.quality >= 2160) qualityStr = '2160p';
+                        else if (link.quality >= 1440) qualityStr = '1440p';
+                        else if (link.quality >= 1080) qualityStr = '1080p';
+                        else if (link.quality >= 720) qualityStr = '720p';
+                        else if (link.quality >= 480) qualityStr = '480p';
+                        else if (link.quality >= 360) qualityStr = '360p';
+                        else qualityStr = '240p';
 
                         return {
                             name: `Moviesdrive ${serverName}`,
@@ -1127,15 +1369,26 @@ function getStreams(tmdbId, mediaType = 'movie', season = null, episode = null) 
                         };
                     });
 
-                // Sort by quality
-                const qualityOrder = { '4K': 4, '2160p': 4, '1440p': 3, '1080p': 2, '720p': 1, '480p': 0, '360p': -1, 'Unknown': -2 };
+                // Sort by quality (highest first)
+                const qualityOrder = {
+                    '2160p': 5,
+                    '1440p': 4,
+                    '1080p': 3,
+                    '720p': 2,
+                    '480p': 1,
+                    '360p': 0,
+                    '240p': -1,
+                    'Unknown': -2
+                };
+
                 streams.sort(function (a, b) {
-                    return (qualityOrder[b.quality] || -3) - (qualityOrder[a.quality] || -3);
+                    return (qualityOrder[b.quality] ?? -3) - (qualityOrder[a.quality] ?? -3);
                 });
 
                 console.log(`[Moviesdrive] Found ${streams.length} streams`);
                 return streams;
             });
+
         });
     }).catch(function (error) {
         console.error(`[Moviesdrive] Scraping error: ${error.message}`);
