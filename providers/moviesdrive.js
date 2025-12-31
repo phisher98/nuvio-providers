@@ -604,7 +604,7 @@ function hubCloudExtractor(url, referer) {
 }
 
 
-function gdFlixExtractor(url, referer = null) {
+async function gdFlixExtractor(url, referer = null) {
     const links = [];
 
     const getIndexQuality = (name) => {
@@ -617,221 +617,193 @@ function gdFlixExtractor(url, referer = null) {
         const m = size.match(/([\d.]+)\s*(GB|MB|KB)/i);
         if (!m) return 0;
         const v = parseFloat(m[1]);
-        return m[2].toUpperCase() === 'GB'
-            ? v * 1024 ** 3
-            : m[2].toUpperCase() === 'MB'
-                ? v * 1024 ** 2
-                : v * 1024;
+        return m[2].toUpperCase() === 'GB' ? v * 1024 ** 3 :
+            m[2].toUpperCase() === 'MB' ? v * 1024 ** 2 :
+                v * 1024;
     };
 
-    // Step 1: handle meta refresh
-    return fetch(url, { headers: HEADERS })
-        .then(res => res.text())
-        .then(html => {
-            const refresh = html.match(/url=([^"]+)/i);
-            const finalUrl = refresh ? refresh[1] : url;
-            return fetch(finalUrl, { headers: HEADERS }).then(r => r.text());
-        })
-        .then(page => {
-            const $ = cheerio.load(page);
+    try {
+        /* meta refresh redirect */
+        let res = await fetch(url, { headers: HEADERS });
+        let html = await res.text();
+        let refresh = html.match(/url=([^"]+)/i);
+        let finalUrl = refresh ? refresh[1] : url;
 
-            const fileName = $('li:contains("Name")').text().replace('Name :', '').trim();
-            const fileSizeText = $('li:contains("Size")').text().replace('Size :', '').trim();
-            const quality = getIndexQuality(fileName);
-            const sizeBytes = toBytes(fileSizeText);
+        const page = await fetch(finalUrl, { headers: HEADERS }).then(r => r.text());
+        const $ = cheerio.load(page);
 
-            const anchors = $('div.text-center a[href]').get();
+        const fileName = $('li:contains("Name")').text().replace('Name :', '').trim();
+        const fileSizeText = $('li:contains("Size")').text().replace('Size :', '').trim();
+        const quality = getIndexQuality(fileName);
+        const sizeBytes = toBytes(fileSizeText);
 
-            // Sequential processing (safe)
-            return anchors.reduce((p, a) => {
-                return p.then(() => {
-                    const el = $(a);
-                    const text = el.text().toLowerCase();
-                    const href = el.attr('href');
+        const anchors = $('div.text-center a[href]').get();
 
-                    /* DIRECT */
-                    if (text.includes('direct')) {
-                        links.push({
-                            source: 'GDFlix [Direct]',
-                            quality,
-                            url: href,
-                            size: sizeBytes,
-                            fileName
-                        });
-                        return Promise.resolve();
-                    }
+        for (const a of anchors) {
+            const el = $(a);
+            const text = el.text().toLowerCase();
+            const href = el.attr('href');
 
-                    /* INDEX */
-                    if (text.includes('index')) {
-                        return fetch(`https://new6.gdflix.dad${href}`)
-                            .then(r => r.text())
-                            .then(indexPage => {
-                                const $$ = cheerio.load(indexPage);
-                                const btns = $$('a.btn-outline-info').get();
-
-                                return btns.reduce((pp, b) => {
-                                    return pp.then(() => {
-                                        const serverUrl = 'https://new6.gdflix.dad' + $$(b).attr('href');
-                                        return fetch(serverUrl)
-                                            .then(r => r.text())
-                                            .then(serverPage => {
-                                                const $$$ = cheerio.load(serverPage);
-                                                $$$('div.mb-4 > a[href]').each((_, x) => {
-                                                    links.push({
-                                                        source: 'GDFlix [Index]',
-                                                        quality,
-                                                        url: $$(x).attr('href'),
-                                                        size: sizeBytes,
-                                                        fileName
-                                                    });
-                                                });
-                                            });
-                                    });
-                                }, Promise.resolve());
-                            });
-                    }
-
-                    /* DRIVEBOT */
-                    if (text.includes('drivebot')) {
-                        const id = href.match(/id=([^&]+)/)?.[1];
-                        const doId = href.match(/do=([^=]+)/)?.[1];
-                        if (!id || !doId) return Promise.resolve();
-
-                        const bases = ['https://drivebot.sbs', 'https://drivebot.cfd'];
-
-                        return bases.reduce((pp, base) => {
-                            return pp.then(() =>
-                                fetch(`${base}/download?id=${id}&do=${doId}`)
-                                    .then(bot => {
-                                        const cookie = bot.headers.get('set-cookie') || '';
-                                        return bot.text().then(html => ({ html, cookie }));
-                                    })
-                                    .then(({ html, cookie }) => {
-                                        const token = html.match(/token', '([a-f0-9]+)/)?.[1];
-                                        const postId = html.match(/download\?id=([^']+)/)?.[1];
-                                        if (!token || !postId) return;
-
-                                        return fetch(`${base}/download?id=${postId}`, {
-                                            method: 'POST',
-                                            headers: {
-                                                'Content-Type': 'application/x-www-form-urlencoded',
-                                                'Referer': `${base}/download?id=${id}&do=${doId}`,
-                                                'Cookie': cookie
-                                            },
-                                            body: `token=${token}`
-                                        })
-                                            .then(r => r.text())
-                                            .then(dl => {
-                                                const final = dl.match(/url":"(.*?)"/)?.[1]?.replace(/\\/g, '');
-                                                if (final) {
-                                                    links.push({
-                                                        source: 'GDFlix [DriveBot]',
-                                                        quality,
-                                                        url: final,
-                                                        size: sizeBytes,
-                                                        fileName
-                                                    });
-                                                }
-                                            });
-                                    })
-                                    .catch(() => {})
-                            );
-                        }, Promise.resolve());
-                    }
-
-                    /* INSTANT */
-                    if (text.includes('instant')) {
-                        return fetch(href, { redirect: 'manual' })
-                            .then(r => {
-                                const loc = r.headers.get('location');
-                                if (loc) {
-                                    links.push({
-                                        source: 'GDFlix [Instant]',
-                                        quality,
-                                        url: loc.replace('url=', ''),
-                                        size: sizeBytes,
-                                        fileName
-                                    });
-                                }
-                            });
-                    }
-
-                    /* GOFILE */
-                    if (text.includes('gofile')) {
-                        return goFileExtractor(href).then(extracted => {
-                            extracted.forEach(l => links.push({
-                                ...l,
-                                quality,
-                                size: l.size || sizeBytes,
-                                fileName
-                            }));
-                        });
-                    }
-
-                    /* PIXELDRAIN */
-                    if (text.includes('pixel')) {
-                        links.push({
-                            source: 'GDFlix [PixelDrain]',
-                            quality,
-                            url: href,
-                            size: sizeBytes,
-                            fileName
-                        });
-                    }
-
-                    return Promise.resolve();
+            /* DIRECT */
+            if (text.includes('direct')) {
+                links.push({
+                    source: 'GDFlix [Direct]',
+                    quality,
+                    url: href,
+                    size: sizeBytes,
+                    fileName
                 });
-            }, Promise.resolve());
-        })
-        .then(() => links)
-        .catch(() => []);
+            }
+
+            /* INDEX LINKS */
+            else if (text.includes('index')) {
+                const indexPage = await fetch(`https://new6.gdflix.dad${href}`).then(r => r.text());
+                const $$ = cheerio.load(indexPage);
+
+                const btns = $$('a.btn-outline-info').get();
+                for (const b of btns) {
+                    const serverUrl = 'https://new6.gdflix.dad' + $$(b).attr('href');
+                    const serverPage = await fetch(serverUrl).then(r => r.text());
+                    const $$$ = cheerio.load(serverPage);
+
+                    $$$('div.mb-4 > a[href]').each((_, x) => {
+                        links.push({
+                            source: 'GDFlix [Index]',
+                            quality,
+                            url: $$(x).attr('href'),
+                            size: sizeBytes,
+                            fileName
+                        });
+                    });
+                }
+            }
+
+            /* DRIVEBOT */
+            else if (text.includes('drivebot')) {
+                const id = href.match(/id=([^&]+)/)?.[1];
+                const doId = href.match(/do=([^=]+)/)?.[1];
+                if (!id || !doId) continue;
+
+                const bases = ['https://drivebot.sbs', 'https://drivebot.cfd'];
+
+                for (const base of bases) {
+                    try {
+                        const bot = await fetch(`${base}/download?id=${id}&do=${doId}`);
+                        const cookie = bot.headers.get('set-cookie') || '';
+                        const html = await bot.text();
+
+                        const token = html.match(/token', '([a-f0-9]+)/)?.[1];
+                        const postId = html.match(/download\?id=([^']+)/)?.[1];
+                        if (!token || !postId) continue;
+
+                        const dl = await fetch(`${base}/download?id=${postId}`, {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/x-www-form-urlencoded',
+                                'Referer': `${base}/download?id=${id}&do=${doId}`,
+                                'Cookie': cookie
+                            },
+                            body: `token=${token}`
+                        }).then(r => r.text());
+
+                        const final = dl.match(/url":"(.*?)"/)?.[1]?.replace(/\\/g, '');
+                        if (final) {
+                            links.push({
+                                source: 'GDFlix [DriveBot]',
+                                quality,
+                                url: final,
+                                size: sizeBytes,
+                                fileName
+                            });
+                        }
+                    } catch { }
+                }
+            }
+
+            /* INSTANT DL */
+            else if (text.includes('instant')) {
+                const r = await fetch(href, { redirect: 'manual' });
+                const loc = r.headers.get('location');
+                if (loc) {
+                    links.push({
+                        source: 'GDFlix [Instant]',
+                        quality,
+                        url: loc.replace('url=', ''),
+                        size: sizeBytes,
+                        fileName
+                    });
+                }
+            }
+
+            /* GOFILE */
+            else if (text.includes('gofile')) {
+                const extracted = await goFileExtractor(href);
+                extracted.forEach(l => links.push({
+                    ...l,
+                    quality,
+                    size: l.size || sizeBytes,
+                    fileName
+                }));
+            }
+
+            /* PIXELDRAIN */
+            else if (text.includes('pixel')) {
+                return pixelDrainExtractor(link)
+                        .then(extracted => {
+                            links.push(...extracted.map(l => ({
+                                ...l,
+                                quality: typeof l.quality === 'number' ? l.quality : quality,
+                                size: l.size || sizeInBytes,
+                                fileName
+                            })));
+                        }).catch(() => { });
+            }
+        }
+    } catch { }
+
+    return links;
 }
 
-function goFileExtractor(url) {
+async function goFileExtractor(url) {
     const links = [];
+    try {
+        const id = url.match(/(?:\?c=|\/d\/)([a-zA-Z0-9-]+)/)?.[1];
+        if (!id) return [];
 
-    const getIndexQuality = (name) => {
-        const m = (name || '').match(/(\d{3,4})[pP]/);
-        return m ? parseInt(m[1]) : 1080;
-    };
+        const acc = await fetch('https://api.gofile.io/accounts', { method: 'POST' }).then(r => r.json());
+        const token = acc?.data?.token;
+        if (!token) return [];
 
-    const id = url.match(/(?:\?c=|\/d\/)([a-zA-Z0-9-]+)/)?.[1];
-    if (!id) return Promise.resolve([]);
+        const js = await fetch('https://gofile.io/dist/js/global.js').then(r => r.text());
+        const wt = js.match(/appdata\.wt\s*=\s*["']([^"']+)/)?.[1];
+        if (!wt) return [];
 
-    return fetch('https://api.gofile.io/accounts', { method: 'POST' })
-        .then(r => r.json())
-        .then(acc => {
-            const token = acc?.data?.token;
-            if (!token) return [];
+        const data = await fetch(`https://api.gofile.io/contents/${id}?wt=${wt}`, {
+            headers: { Authorization: `Bearer ${token}` }
+        }).then(r => r.json());
 
-            return fetch('https://gofile.io/dist/js/global.js')
-                .then(r => r.text())
-                .then(js => {
-                    const wt = js.match(/appdata\.wt\s*=\s*["']([^"']+)/)?.[1];
-                    if (!wt) return [];
+        const files = Object.values(data.data.children);
+        const file = files[0];
+        if (!file) return [];
 
-                    return fetch(`https://api.gofile.io/contents/${id}?wt=${wt}`, {
-                        headers: { Authorization: `Bearer ${token}` }
-                    }).then(r => r.json());
-                })
-                .then(data => {
-                    const files = Object.values(data?.data?.children || {});
-                    const file = files[0];
-                    if (!file) return [];
+        const size = file.size;
+        const sizeFormatted =
+            size < 1024 ** 3
+                ? `${(size / 1024 ** 2).toFixed(2)} MB`
+                : `${(size / 1024 ** 3).toFixed(2)} GB`;
 
-                    links.push({
-                        source: 'GoFile',
-                        quality: getIndexQuality(file.name),
-                        url: file.link,
-                        size: file.size,
-                        fileName: file.name,
-                        headers: { Cookie: `accountToken=${token}` }
-                    });
+        links.push({
+            source: 'GoFile',
+            quality: getIndexQuality(file.name),
+            url: file.link,
+            size,
+            fileName: file.name,
+            headers: { Cookie: `accountToken=${token}` },
+            label: `GoFile [${sizeFormatted}]`
+        });
+    } catch { }
 
-                    return links;
-                });
-        })
-        .catch(() => []);
+    return links;
 }
 
 
@@ -1035,7 +1007,7 @@ function getDownloadLinks(mediaUrl, season, episode) {
                 });
 
 
-                return Promise.all(extractorPromises).then(results => {
+                return Promise.all(promises).then(results => {
                     const flat = results.flat(2);
 
                     const seen = new Set();
@@ -1046,14 +1018,15 @@ function getDownloadLinks(mediaUrl, season, episode) {
                     });
 
                     console.error(
-                        `[Moviesdrive] Final extracted episode streams: ${finalLinks.length}`
+                        `[Moviesdrive] Final extracted movie streams: ${finalLinks.length}`
                     );
 
                     return {
                         finalLinks,
-                        isMovie: false
+                        isMovie: true
                     };
                 });
+
 
             } else {
                 // =========================
@@ -1350,53 +1323,43 @@ function getStreams(tmdbId, mediaType = 'movie', season = null, episode = null) 
             console.log(`[Moviesdrive] Selected: "${selectedMedia.title}" (${selectedMedia.url})`);
 
             // Get download links
-            return getDownloadLinks(selectedMedia.url).then(function (result) {
+            return getDownloadLinks(selectedMedia.url, season, episode).then(function (result) {
                 const { finalLinks, isMovie } = result;
 
-                // Filter by episode if specified for TV shows
                 let filteredLinks = finalLinks;
-                if (mediaType === 'tv' && episode !== null) {
-                    filteredLinks = finalLinks.filter(function (link) {
-                        return link.episode === episode;
-                    });
-                    console.log(`[Moviesdrive] Filtered to ${filteredLinks.length} links for episode ${episode}`);
-                }
 
-                // Convert to Nuvio format, filtering out unknown quality links
                 const streams = filteredLinks
                     .filter(function (link) {
-                        // Skip links with unknown quality - these are usually just redirects
-                        if (typeof link.quality !== 'number' || link.quality === 0) {
-                            return false;
-                        }
-                        return true;
+                        return typeof link.quality === 'number' && link.quality > 0;
                     })
                     .map(function (link) {
-                        // Use the actual file name from HubCloud page if available, otherwise fallback to TMDB title
-                        let mediaTitle = link.fileName && link.fileName !== 'Unknown' ? link.fileName : mediaInfo.title;
-                        if (mediaType === 'tv' && season && episode && link.episode && !link.fileName) {
-                            mediaTitle = `${mediaInfo.title} S${String(season).padStart(2, '0')}E${String(link.episode).padStart(2, '0')}`;
-                        } else if (mediaType === 'tv' && season && episode && !link.fileName) {
-                            mediaTitle = `${mediaInfo.title} S${String(season).padStart(2, '0')}E${String(episode).padStart(2, '0')}`;
-                        } else if (mediaInfo.year && !link.fileName) {
+                        let mediaTitle;
+                        if (link.fileName && link.fileName !== 'Unknown') {
+                            mediaTitle = link.fileName;
+                        } else if (mediaType === 'tv' && season && episode) {
+                            mediaTitle =
+                                `${mediaInfo.title} ` +
+                                `S${String(season).padStart(2, '0')}` +
+                                `E${String(episode).padStart(2, '0')}`;
+                        } else if (mediaInfo.year) {
                             mediaTitle = `${mediaInfo.title} (${mediaInfo.year})`;
+                        } else {
+                            mediaTitle = mediaInfo.title;
                         }
 
-                        // Format size and extract server name
+                        // Size & server
                         const formattedSize = formatBytes(link.size);
                         const serverName = extractServerName(link.source);
 
-                        // Create quality string
+                        // Quality normalization (APP-SAFE)
                         let qualityStr = 'Unknown';
-                        if (typeof link.quality === 'number') {
-                            if (link.quality >= 2160) qualityStr = '4K';
-                            else if (link.quality >= 1440) qualityStr = '1440p';
-                            else if (link.quality >= 1080) qualityStr = '1080p';
-                            else if (link.quality >= 720) qualityStr = '720p';
-                            else if (link.quality >= 480) qualityStr = '480p';
-                            else if (link.quality >= 360) qualityStr = '360p';
-                            else qualityStr = '240p';
-                        }
+                        if (link.quality >= 2160) qualityStr = '2160p';
+                        else if (link.quality >= 1440) qualityStr = '1440p';
+                        else if (link.quality >= 1080) qualityStr = '1080p';
+                        else if (link.quality >= 720) qualityStr = '720p';
+                        else if (link.quality >= 480) qualityStr = '480p';
+                        else if (link.quality >= 360) qualityStr = '360p';
+                        else qualityStr = '240p';
 
                         return {
                             name: `Moviesdrive ${serverName}`,
@@ -1409,15 +1372,26 @@ function getStreams(tmdbId, mediaType = 'movie', season = null, episode = null) 
                         };
                     });
 
-                // Sort by quality
-                const qualityOrder = { '4K': 4, '2160p': 4, '1440p': 3, '1080p': 2, '720p': 1, '480p': 0, '360p': -1, 'Unknown': -2 };
+                // Sort by quality (highest first)
+                const qualityOrder = {
+                    '2160p': 5,
+                    '1440p': 4,
+                    '1080p': 3,
+                    '720p': 2,
+                    '480p': 1,
+                    '360p': 0,
+                    '240p': -1,
+                    'Unknown': -2
+                };
+
                 streams.sort(function (a, b) {
-                    return (qualityOrder[b.quality] || -3) - (qualityOrder[a.quality] || -3);
+                    return (qualityOrder[b.quality] ?? -3) - (qualityOrder[a.quality] ?? -3);
                 });
 
                 console.log(`[Moviesdrive] Found ${streams.length} streams`);
                 return streams;
             });
+
         });
     }).catch(function (error) {
         console.error(`[Moviesdrive] Scraping error: ${error.message}`);
