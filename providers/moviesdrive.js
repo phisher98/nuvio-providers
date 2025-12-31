@@ -1322,109 +1322,126 @@ function findBestTitleMatch(mediaInfo, searchResults, mediaType, season) {
  * @returns {Promise<Array>} Array of stream objects
  */
 function getStreams(tmdbId, mediaType = 'movie', season = null, episode = null) {
-    console.log(`[Moviesdrive] Fetching streams for TMDB ID: ${tmdbId}, Type: ${mediaType}${mediaType === 'tv' ? `, S:${season}E:${episode}` : ''}`);
+    console.log(
+        `[Moviesdrive] Fetching streams for TMDB ID: ${tmdbId}, Type: ${mediaType}` +
+        (mediaType === 'tv' ? `, S:${season}E:${episode}` : '')
+    );
 
-    // First, get movie/TV show details from TMDB
-    return getTMDBDetails(tmdbId, mediaType).then(function (mediaInfo) {
-        if (!mediaInfo.title) {
-            throw new Error('Could not extract title from TMDB response');
-        }
-
-        console.log(`[Moviesdrive] TMDB Info: "${mediaInfo.title}" (${mediaInfo.year || 'N/A'})`);
-
-        // Search for the content
-        const searchQuery = mediaType === 'tv' && season ? `${mediaInfo.title} season ${season}` : mediaInfo.title;
-        console.log(`[Moviesdrive] Searching for: "${searchQuery}"`);
-
-        return search(searchQuery).then(function (searchResults) {
-            if (searchResults.length === 0) {
-                console.log('[Moviesdrive] No search results found');
+    return getTMDBDetails(tmdbId, mediaType)
+        .then(function (mediaInfo) {
+            if (!mediaInfo || !mediaInfo.title) {
+                console.log('[Moviesdrive] TMDB details missing');
                 return [];
             }
 
-            // Find best match using improved title matching
-            const bestMatch = findBestTitleMatch(mediaInfo, searchResults, mediaType, season);
+            console.log(
+                `[Moviesdrive] TMDB Info: "${mediaInfo.title}" (${mediaInfo.year || 'N/A'})`
+            );
 
-            const selectedMedia = bestMatch || searchResults[0];
+            const isSeries = mediaType === 'tv';
+            const searchQuery =
+                isSeries && season
+                    ? `${mediaInfo.title} season ${season}`
+                    : mediaInfo.title;
 
-            console.log(`[Moviesdrive] Selected: "${selectedMedia.title}" (${selectedMedia.url})`);
+            console.log(`[Moviesdrive] Searching for: "${searchQuery}"`);
 
-            // Get download links
-            return getDownloadLinks(selectedMedia.url, season, episode).then(function (result) {
-                const { finalLinks, isMovie } = result;
+            return search(searchQuery).then(function (searchResults) {
+                if (!searchResults || searchResults.length === 0) {
+                    console.log('[Moviesdrive] No search results found');
+                    return [];
+                }
 
-                let filteredLinks = finalLinks;
+                const bestMatch =
+                    findBestTitleMatch(mediaInfo, searchResults, mediaType, season);
 
-                const streams = filteredLinks
-                    .filter(function (link) {
-                        return typeof link.quality === 'number' && link.quality > 0;
-                    })
-                    .map(function (link) {
-                        let mediaTitle;
-                        if (link.fileName && link.fileName !== 'Unknown') {
-                            mediaTitle = link.fileName;
-                        } else if (mediaType === 'tv' && season && episode) {
-                            mediaTitle =
-                                `${mediaInfo.title} ` +
-                                `S${String(season).padStart(2, '0')}` +
-                                `E${String(episode).padStart(2, '0')}`;
-                        } else if (mediaInfo.year) {
-                            mediaTitle = `${mediaInfo.title} (${mediaInfo.year})`;
-                        } else {
-                            mediaTitle = mediaInfo.title;
+                const selectedMedia = bestMatch || searchResults[0];
+
+                console.log(
+                    `[Moviesdrive] Selected: "${selectedMedia.title}" (${selectedMedia.url})`
+                );
+
+                return getDownloadLinks(selectedMedia.url, season, episode)
+                    .then(function (result) {
+                        if (!result || !Array.isArray(result.finalLinks)) {
+                            return [];
                         }
 
-                        // Size & server
-                        const formattedSize = formatBytes(link.size);
-                        const serverName = extractServerName(link.source);
+                        const finalLinks = result.finalLinks;
 
-                        // Quality normalization (APP-SAFE)
-                        let qualityStr = 'Unknown';
-                        if (link.quality >= 2160) qualityStr = '2160p';
-                        else if (link.quality >= 1440) qualityStr = '1440p';
-                        else if (link.quality >= 1080) qualityStr = '1080p';
-                        else if (link.quality >= 720) qualityStr = '720p';
-                        else if (link.quality >= 480) qualityStr = '480p';
-                        else if (link.quality >= 360) qualityStr = '360p';
-                        else qualityStr = '240p';
+                        const streams = finalLinks
+                            .filter(function (link) {
+                                return typeof link.quality === 'number' && link.quality > 0;
+                            })
+                            .map(function (link) {
+                                let mediaTitle;
 
-                        return {
-                            name: `Moviesdrive ${serverName}`,
-                            title: mediaTitle,
-                            url: link.url,
-                            quality: qualityStr,
-                            size: formattedSize,
-                            headers: HEADERS,
-                            provider: 'Moviesdrive'
+                                if (link.fileName && link.fileName !== 'Unknown') {
+                                    mediaTitle = link.fileName;
+                                } else if (isSeries && season && episode) {
+                                    mediaTitle =
+                                        `${mediaInfo.title} ` +
+                                        `S${String(season).padStart(2, '0')}` +
+                                        `E${String(episode).padStart(2, '0')}`;
+                                } else if (mediaInfo.year) {
+                                    mediaTitle = `${mediaInfo.title} (${mediaInfo.year})`;
+                                } else {
+                                    mediaTitle = mediaInfo.title;
+                                }
+
+                                const formattedSize = formatBytes(link.size);
+                                const serverName = extractServerName(link.source);
+
+                                let qualityStr = 'Unknown';
+                                if (link.quality >= 2160) qualityStr = '2160p';
+                                else if (link.quality >= 1440) qualityStr = '1440p';
+                                else if (link.quality >= 1080) qualityStr = '1080p';
+                                else if (link.quality >= 720) qualityStr = '720p';
+                                else if (link.quality >= 480) qualityStr = '480p';
+                                else if (link.quality >= 360) qualityStr = '360p';
+                                else qualityStr = '240p';
+
+                                return {
+                                    name: `Moviesdrive ${serverName}`,
+                                    title: mediaTitle,
+                                    url: link.url,
+                                    quality: qualityStr,
+                                    size: formattedSize,
+                                    headers: HEADERS,
+                                    provider: 'Moviesdrive'
+                                };
+                            });
+
+                        const qualityOrder = {
+                            '2160p': 5,
+                            '1440p': 4,
+                            '1080p': 3,
+                            '720p': 2,
+                            '480p': 1,
+                            '360p': 0,
+                            '240p': -1,
+                            'Unknown': -2
                         };
+
+                        streams.sort(function (a, b) {
+                            return (qualityOrder[b.quality] ?? -3) -
+                                   (qualityOrder[a.quality] ?? -3);
+                        });
+
+                        console.log(`[Moviesdrive] Found ${streams.length} streams`);
+                        return streams;
+                    })
+                    .catch(function () {
+                        return [];
                     });
-
-                // Sort by quality (highest first)
-                const qualityOrder = {
-                    '2160p': 5,
-                    '1440p': 4,
-                    '1080p': 3,
-                    '720p': 2,
-                    '480p': 1,
-                    '360p': 0,
-                    '240p': -1,
-                    'Unknown': -2
-                };
-
-                streams.sort(function (a, b) {
-                    return (qualityOrder[b.quality] ?? -3) - (qualityOrder[a.quality] ?? -3);
-                });
-
-                console.log(`[Moviesdrive] Found ${streams.length} streams`);
-                return streams;
             });
-
+        })
+        .catch(function (err) {
+            console.error('[Moviesdrive] Scraping error:', err.message);
+            return [];
         });
-    }).catch(function (error) {
-        console.error(`[Moviesdrive] Scraping error: ${error.message}`);
-        return [];
-    });
 }
+
 
 // Export the main function
 if (typeof module !== 'undefined' && module.exports) {
