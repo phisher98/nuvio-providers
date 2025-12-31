@@ -440,7 +440,6 @@ function hubDriveExtractor(url, referer) {
 
 function hubCloudExtractor(url, referer) {
     let currentUrl = url;
-    console.log(`[HubCloud] Extracting from ${currentUrl}`);
     // Replicate domain change logic from HubCloud extractor
     if (currentUrl.includes("hubcloud.ink")) {
         currentUrl = currentUrl.replace("hubcloud.ink", "hubcloud.dad");
@@ -504,11 +503,8 @@ function hubCloudExtractor(url, referer) {
 
             // Process each element, converting async operations to promises
             const processElements = elements.map(element => {
-                console.log(`[HubCloud] Processing link: ${$(element).attr('href')}`);
-
                 const link = $(element).attr('href');
                 const text = $(element).text();
-                const sourceName = text.trim();
 
                 // Use the actual file name from the HubCloud page header (full name, not cleaned)
                 const fileName = header || headerDetails || 'Unknown';
@@ -741,43 +737,51 @@ function getDownloadLinks(mediaUrl) {
 
                 const hosterRegex = /hubcloud|gdflix|gdlink/i;
 
-                const extractMdrive = async (url) => {
-                    try {
-                        const res = await fetch(url, {
-                            headers: {
-                                'User-Agent': 'Mozilla/5.0'
-                            }
-                        });
+                const extractMdrive = (url) => {
+    return fetch(url, {
+        headers: {
+            'User-Agent': 'Mozilla/5.0'
+        }
+    })
+    .then(res => res.text())
+    .then(html => {
+        const $$ = cheerio.load(html);
 
-                        const html = await res.text();
-                        const $$ = cheerio.load(html);
+        return $$('a[href]')
+            .map((_, el) => {
+                const href = $$(el).attr('href');
+                return hosterRegex.test(href) ? href : null;
+            })
+            .get()
+            .filter(Boolean);
+    })
+    .catch(e => {
+        console.error('[Moviesdrive] Error extracting links:', e.message);
+        return [];
+    });
+};
 
-                        return $$('a[href]')
-                            .map((_, el) => {
-                                const href = $$(el).attr('href');
-                                return hosterRegex.test(href) ? href : null;
-                            })
-                            .get()
-                            .filter(Boolean);
 
-                    } catch (e) {
-                        console.error('[Moviesdrive] Error extracting links:', e.message);
+                const promises = links.map(url => {
+    return extractMdrive(url).then(extractedUrls => {
+        return Promise.all(
+            extractedUrls.map(serverUrl =>
+                loadExtractor(serverUrl, mediaUrl)
+                    .catch(err => {
+                        console.error(
+                            `[Moviesdrive] Failed extractor ${serverUrl}:`,
+                            err.message
+                        );
                         return [];
-                    }
-                };
+                    })
+            )
+        );
+    }).catch(err => {
+        console.error('[Moviesdrive] Failed extractMdrive:', err.message);
+        return [];
+    });
+});
 
-                const promises = links.map(async (url) => {
-                    const extractedUrls = await extractMdrive(url);
-                    return Promise.all(
-                        extractedUrls.map(serverUrl =>
-                            loadExtractor(serverUrl, mediaUrl)
-                                .catch(err => {
-                                    console.error(`[Moviesdrive] Failed extractor ${serverUrl}:`, err.message);
-                                    return [];
-                                })
-                        )
-                    );
-                });
 
                 return Promise.all(promises).then(results => {
                     const flat = results.flat(2);
